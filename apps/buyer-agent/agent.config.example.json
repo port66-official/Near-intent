@@ -1,0 +1,22 @@
+{
+  "killSwitch": false,
+  "maxItemUsd": 300,
+  "dailyBudgetUsd": 350,
+  "maxRoutingPct": 3,
+  "payWith": ["SOL", "BTC", "NEAR", "ETH"],
+  "negotiation": {
+    "enabled": true,
+    "stretchPct": 25
+  },
+  "minSellerRating": 0,
+  "shipTo": {
+    "name": "Agent Owner",
+    "line1": "1 Example Street",
+    "line2": "",
+    "city": "London",
+    "region": "",
+    "postal": "E1 6AN",
+    "country": "GB",
+    "phone": ""
+  }
+}

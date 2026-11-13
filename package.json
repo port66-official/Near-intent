@@ -1,0 +1,14 @@
+{
+  "name": "port66-near-intents",
+  "private": true,
+  "description": "Port66's NEAR Intents checkout and buyer agent (NEAR Hackathon)",
+  "scripts": {
+    "dry-run": "tsx apps/api/scripts/near-intents-dry-run.ts",
+    "agent": "pnpm --dir apps/buyer-agent agent",
+    "test": "pnpm --dir apps/buyer-agent test"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "viem": "^2.52.0"
+  }
+}

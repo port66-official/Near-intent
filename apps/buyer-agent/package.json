@@ -1,0 +1,26 @@
+{
+  "name": "@port66/buyer-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An AI buyer agent that shops Port66 within a budget and pays from any chain through NEAR Intents",
+  "type": "module",
+  "scripts": {
+    "agent": "tsx src/cli.ts",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solana/web3.js": "1.99.0",
+    "@valiron/sdk": "2.0.0",
+    "@x402/core": "2.17.0",
+    "@x402/evm": "2.17.0",
+    "bs58": "^6.0.0",
+    "near-api-js": "5.1.1",
+    "viem": "^2.52.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}

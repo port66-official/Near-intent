@@ -1,0 +1,1095 @@
+diff --git a/.env.example b/.env.example
+index 3f723c4..1f58b28 100644
+--- a/.env.example
++++ b/.env.example
+@@ -55,6 +55,14 @@ NEXT_PUBLIC_SOLANA_PAYMENTS_ENABLED="false"
+ NEXT_PUBLIC_SOLANA_CLUSTER="devnet"
+ NEXT_PUBLIC_SOLANA_RPC_URL="https://api.devnet.solana.com"
+ 
++# NEAR Intents: pay from any chain, seller receives USDC on Solana (mainnet only).
++# The key is optional; without it quotes carry an extra 0.25% fee.
++NEAR_INTENTS_ENABLED="false"
++NEAR_INTENTS_API_KEY=""
++# Optional Port66 fee on Intents payments: a NEAR account and basis points (max 100).
++NEAR_INTENTS_FEE_RECIPIENT=""
++NEAR_INTENTS_FEE_BPS=""
++
+ # ─── Privy (embedded wallets for email/Google-only accounts) ────────────────────
+ # Email wallets require Clerk custom authentication and verified ownership.
+ # Credentials alone do not enable deposits.
+diff --git a/apps/api/.env.production.example b/apps/api/.env.production.example
+index 911da20..66a6446 100644
+--- a/apps/api/.env.production.example
++++ b/apps/api/.env.production.example
+@@ -133,6 +133,19 @@ SOLANA_ORDER_RECORDING_ENABLED=false
+ SOLANA_CLUSTER=devnet
+ SOLANA_RPC_URL=https://api.devnet.solana.com
+ 
++# ── NEAR Intents: pay from any chain ─────────────────────────────────────────
++# Buyers pay in BTC, SOL, NEAR, ETH...; the seller receives exact USDC on
++# Solana. Mainnet only: also needs SOLANA_PAYMENTS_ENABLED=true and
++# SOLANA_CLUSTER=mainnet-beta. The API key is optional (partners.near-intents.org);
++# without it every quote carries an extra 0.25% fee.
++NEAR_INTENTS_ENABLED=false
++NEAR_INTENTS_API_KEY=
++# Port66's share of each cross-chain payment, paid inside the same swap to a
++# NEAR account. The seller still receives the exact price; the buyer pays the
++# fee on top. Off unless both are set. Basis points, capped at 100 (1%).
++NEAR_INTENTS_FEE_RECIPIENT=
++NEAR_INTENTS_FEE_BPS=
++
+ # ── Tokenized SKU inventory (V1, opt-in) ──────────────────────────────────────
+ # Optional Base-native ERC-1155 inventory claims. See docs/sku-tokenization-v1-plan.md.
+ # BOTH flags default to false in EVERY environment. Nothing is minted, purchasable,
+diff --git a/apps/api/package.json b/apps/api/package.json
+index 22a1f6d..0f35789 100644
+--- a/apps/api/package.json
++++ b/apps/api/package.json
+@@ -13,6 +13,7 @@
+     "lint": "eslint src --ext .ts",
+     "type-check": "tsc --noEmit",
+     "test": "jest",
++    "intents:dry-run": "ts-node --transpile-only scripts/near-intents-dry-run.ts",
+     "test:watch": "jest --watch",
+     "test:solana-runtime": "node --no-experimental-require-module scripts/check-solana-runtime.cjs",
+     "db:generate": "prisma generate",
+diff --git a/apps/api/src/app.module.ts b/apps/api/src/app.module.ts
+index 1327a49..bf9e02c 100644
+--- a/apps/api/src/app.module.ts
++++ b/apps/api/src/app.module.ts
+@@ -16,6 +16,7 @@ import { SocialModule } from "./modules/social/social.module";
+ import { BillboardModule } from "./modules/billboard/billboard.module";
+ import { SearchModule } from "./modules/search/search.module";
+ import { PaymentsModule } from "./modules/payments/payments.module";
++import { NearIntentsModule } from "./modules/near-intents/near-intents.module";
+ import { MessagingModule } from "./modules/messaging/messaging.module";
+ import { TokensModule } from "./modules/tokens/tokens.module";
+ import { FractionalModule } from "./modules/fractional/fractional.module";
+@@ -78,6 +79,7 @@ const redisTls = process.env.REDIS_TLS === "true";
+     BillboardModule,
+     SearchModule,
+     PaymentsModule,
++    NearIntentsModule,
+     MessagingModule,
+     NotificationsModule,
+     TokensModule,
+diff --git a/apps/api/src/modules/payments/checkout-state.service.ts b/apps/api/src/modules/payments/checkout-state.service.ts
+index 28049bc..98fc1f8 100644
+--- a/apps/api/src/modules/payments/checkout-state.service.ts
++++ b/apps/api/src/modules/payments/checkout-state.service.ts
+@@ -9,6 +9,9 @@ import { Prisma } from "../../../node_modules/.prisma/client";
+ import { PrismaService } from "../../prisma/prisma.service";
+ import { usdcUnits } from "./payment-safety";
+ 
++/** Rail name for payments delivered by NEAR Intents solvers. */
++export const INTENTS_RAIL = "intents";
++
+ export type CheckoutItem = {
+   id: string;
+   price: string;
+@@ -39,7 +42,9 @@ export class CheckoutStateService {
+     overridePrice?: number,
+   ) {
+     // Card reservations are mandatory independently of the crypto rollout flag.
+-    if (rail !== "stripe") this.requireEnabled();
++    // So are NEAR Intents ones: the payment lands with the seller minutes
++    // after the quote, so the item must be held for that whole window.
++    if (rail !== "stripe" && rail !== INTENTS_RAIL) this.requireEnabled();
+     if (rail === "base") {
+       payer = payer.toLowerCase();
+       recipient = recipient.toLowerCase();
+@@ -256,6 +261,89 @@ export class CheckoutStateService {
+     await tx.checkoutHold.deleteMany({ where: { intentId: id } });
+   }
+ 
++  // ── NEAR Intents rail ──────────────────────────────────────────────────────
++  // RESERVED  quote issued, nothing deposited: the hold lapses at expiresAt.
++  // PROVIDER  a deposit is in flight: the hold stays until a terminal state.
++  // REVIEW    money moved but could not be matched: held for a human.
++  // PAID / EXPIRED are terminal; both drop the hold.
++
++  /** The buyer's open Intents checkout for a listing, if any. */
++  async intentsFor(buyerId: string, listingId: string) {
++    const hold = await this.db.checkoutHold.findUnique({
++      where: { listingId },
++      include: { intent: true },
++    });
++    const intent = hold?.intent;
++    if (!intent || intent.buyerId !== buyerId || intent.rail !== INTENTS_RAIL)
++      return null;
++    return intent;
++  }
++
++  /** Attach the provider quote to a freshly reserved Intents checkout. */
++  async attachIntentsQuote(
++    id: string,
++    data: {
++      bridge: Prisma.InputJsonValue;
++      providerId: string;
++      expiresAt: Date;
++      shippingAddress?: string;
++    },
++  ) {
++    const result = await this.db.checkoutIntent.updateMany({
++      where: { id, rail: INTENTS_RAIL, status: "RESERVED" },
++      data: {
++        bridge: data.bridge,
++        providerId: data.providerId,
++        expiresAt: data.expiresAt,
++        ...(data.shippingAddress
++          ? { shippingAddress: data.shippingAddress }
++          : {}),
++      },
++    });
++    if (result.count !== 1)
++      throw new ConflictException(
++        "This checkout already has a payment in progress.",
++      );
++    return this.db.checkoutIntent.findUniqueOrThrow({ where: { id } });
++  }
++
++  /** A deposit was seen: keep the item held past the quote window. */
++  async intentsInFlight(id: string) {
++    await this.db.checkoutIntent.updateMany({
++      where: { id, rail: INTENTS_RAIL, status: "RESERVED" },
++      data: { status: "PROVIDER" },
++    });
++  }
++
++  /** Nothing will arrive (expired unpaid, refunded or failed): free the item. */
++  async intentsRelease(id: string) {
++    await this.db.$transaction(async (tx) => {
++      const result = await tx.checkoutIntent.updateMany({
++        where: {
++          id,
++          rail: INTENTS_RAIL,
++          status: { in: ["RESERVED", "PROVIDER"] },
++        },
++        data: { status: "EXPIRED" },
++      });
++      if (result.count)
++        await tx.checkoutHold.deleteMany({ where: { intentId: id } });
++    });
++  }
++
++  /** Money moved but did not reconcile: keep the hold and flag it. */
++  async intentsReview(id: string) {
++    await this.db.checkoutIntent.updateMany({
++      where: {
++        id,
++        rail: INTENTS_RAIL,
++        // EXPIRED too: a deposit can land after an unwatched hold lapsed.
++        status: { in: ["RESERVED", "PROVIDER", "EXPIRED"] },
++      },
++      data: { status: "REVIEW" },
++    });
++  }
++
+   async releaseUnpaidProvider(id: string) {
+     await this.db.$transaction(async (tx) => {
+       const result = await tx.checkoutIntent.updateMany({
+diff --git a/apps/api/src/modules/payments/payments.module.ts b/apps/api/src/modules/payments/payments.module.ts
+index 6dcda38..aa26f6e 100644
+--- a/apps/api/src/modules/payments/payments.module.ts
++++ b/apps/api/src/modules/payments/payments.module.ts
+@@ -18,6 +18,6 @@ import { SolanaNftModule } from "../solana-nft/solana-nft.module";
+     CheckoutStateService,
+     SavedCardsService,
+   ],
+-  exports: [PaymentsService],
++  exports: [PaymentsService, CheckoutStateService],
+ })
+ export class PaymentsModule {}
+diff --git a/apps/api/src/modules/payments/payments.service.ts b/apps/api/src/modules/payments/payments.service.ts
+index 52050a1..3f96288 100644
+--- a/apps/api/src/modules/payments/payments.service.ts
++++ b/apps/api/src/modules/payments/payments.service.ts
+@@ -26,6 +26,7 @@ import { verifyOnChainPayment } from "./verify-onchain";
+ import { basePayoutWallet } from "./payout-wallet";
+ import { PassportDeliveryService } from "../solana-nft/passport-delivery.service";
+ import {
++  INTENTS_RAIL,
+   CheckoutStateService,
+   type CheckoutItem,
+ } from "./checkout-state.service";
+@@ -2309,6 +2310,163 @@ export class PaymentsService {
+         `Payment could not be verified: ${verification.reason}`,
+       );
+     }
++    return this.recordSolanaOrder({
++      buyerId,
++      listingId: input.listingId,
++      listing,
++      price,
++      shipping,
++      signature: input.signature,
++      payerAddress: input.buyerAddress,
++      sellerWallet: sellerSolanaWallet,
++      tokenSymbol: `${input.token}_SOLANA_${config.cluster.toUpperCase()}`,
++      encryptedShippingAddress: input.shippingAddress
++        ? encryptPII(input.shippingAddress)
++        : undefined,
++      intent,
++      saleNote:
++        "Your item sold through a verified Solana USDC payment. Prepare it for shipment.",
++    });
++  }
++
++  /**
++   * Settle a NEAR Intents checkout from the solver's delivery on Solana.
++   *
++   * `signature` MUST come from the provider's status for the deposit address
++   * stored on this checkout, never from a client: the sender check is skipped
++   * here because a solver, not the buyer, delivers the USDC. What is still
++   * enforced on chain is that the seller's wallet received at least the
++   * amount snapshotted when the item was reserved.
++   */
++  async settleIntentsCheckout(
++    intent: {
++      id: string;
++      buyerId: string;
++      rail: string;
++      cluster: string;
++      payer: string;
++      recipient: string;
++      amount: string;
++      items: unknown;
++      shippingAddress?: unknown;
++    },
++    signature: string,
++    paidWith: string,
++  ) {
++    const config = getSolanaPaymentConfig();
++    const onBase = intent.cluster === "base";
++    if (!onBase && !config.enabled)
++      throw new BadRequestException("Solana payments are disabled");
++    if (
++      intent.rail !== INTENTS_RAIL ||
++      (!onBase && intent.cluster !== config.cluster)
++    )
++      throw new BadRequestException("Payment does not match this checkout");
++    const items = intent.items as CheckoutItem[];
++    if (!Array.isArray(items) || items.length !== 1)
++      throw new BadRequestException("Invalid checkout");
++    const snapshot = items[0];
++    const prior = await this.previousPayment(
++      intent.buyerId,
++      [snapshot.id],
++      signature,
++    );
++    if (prior.length) return prior[0];
++
++    const listing = await this.prisma.listing.findUnique({
++      where: { id: snapshot.id },
++      select: {
++        id: true,
++        status: true,
++        sellerId: true,
++        provenanceHash: true,
++        seller: { select: { username: true } },
++      },
++    });
++    if (!listing) throw new NotFoundException("Listing not found");
++    if (listing.status !== "ACTIVE" || listing.sellerId === intent.buyerId)
++      throw new BadRequestException("Listing already sold");
++
++    const price = Number(snapshot.price);
++    const shipping = Number(snapshot.shipping ?? 0);
++    const due = Number((price + shipping).toFixed(6));
++    const verification = onBase
++      ? await verifyOnChainPayment({
++          txHash: signature,
++          chainId: 8453,
++          token: "USDC",
++          sellerAddress: intent.recipient,
++          priceUsd: due,
++          amountBaseUnits: intent.amount,
++          receiptOnly: true,
++        })
++      : await verifySolanaUsdcPayment({
++          signature,
++          amountBaseUnits: intent.amount,
++          buyerAddress: "",
++          sellerAddress: intent.recipient,
++          priceUsd: due,
++          receiptOnly: true,
++        });
++    if (!verification.ok)
++      throw new BadRequestException(
++        `Payment could not be verified: ${verification.reason}`,
++      );
++
++    return this.recordSolanaOrder({
++      buyerId: intent.buyerId,
++      listingId: snapshot.id,
++      listing,
++      price,
++      shipping,
++      signature,
++      payerAddress: intent.payer,
++      sellerWallet: intent.recipient,
++      tokenSymbol: onBase
++        ? `USDC_BASE_VIA_${paidWith}`
++        : `USDC_SOLANA_${config.cluster.toUpperCase()}_VIA_${paidWith}`,
++      ...(onBase ? { chainId: 8453 } : {}),
++      encryptedShippingAddress:
++        typeof intent.shippingAddress === "string"
++          ? intent.shippingAddress
++          : undefined,
++      intent,
++      saleNote: `Your item sold. The buyer paid from another chain through NEAR Intents and the USDC is in your ${onBase ? "Base" : "Solana"} wallet. Prepare it for shipment.`,
++      bindReceipt: true,
++    });
++  }
++
++  /**
++   * Record a verified Solana USDC sale: mark the listing SOLD, create the
++   * order, ownership entry and seller notification, and release the checkout
++   * hold, all in one transaction. Shared by the direct wallet rail and the
++   * NEAR Intents rail; the caller has ALREADY verified the payment on chain.
++   */
++  private async recordSolanaOrder(p: {
++    buyerId: string;
++    listingId: string;
++    listing: {
++      sellerId: string;
++      provenanceHash?: string | null;
++      seller?: { username?: string | null } | null;
++    };
++    price: number;
++    shipping: number;
++    /** Solana signature of the transaction that paid the seller. */
++    signature: string;
++    /** Address the buyer paid from (any chain on the Intents rail). */
++    payerAddress: string;
++    sellerWallet: string;
++    tokenSymbol: string;
++    /** EVM chain the payment settled on; omitted for Solana. */
++    chainId?: number;
++    /** Output of encryptPII, never plaintext. */
++    encryptedShippingAddress?: string;
++    intent?: { id: string; rail: string; payer: string; cluster: string };
++    saleNote: string;
++    bindReceipt?: boolean;
++  }) {
++    const { buyerId, listing, price, shipping, intent } = p;
+     const buyer = await this.prisma.user.findUnique({
+       where: { id: buyerId },
+       select: {
+@@ -2325,16 +2483,16 @@ export class PaymentsService {
+     const order = await this.prisma.$transaction(async (tx) => {
+       if (intent)
+         await tx.$executeRaw`SELECT set_config('port66.checkout_intent', ${intent.id}, true)`;
+-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${input.signature}, 0))`;
++      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${p.signature}, 0))`;
+       const replay = await tx.order.findMany({
+-        where: { transactionHash: input.signature },
++        where: { transactionHash: p.signature },
+       });
+       if (replay.length) {
+-        assertSamePayment(replay, buyerId, [input.listingId]);
++        assertSamePayment(replay, buyerId, [p.listingId]);
+         return replay[0];
+       }
+       const reserved = await tx.listing.updateMany({
+-        where: { id: input.listingId, status: "ACTIVE" },
++        where: { id: p.listingId, status: "ACTIVE" },
+         data: { status: "SOLD", soldAt: new Date(), currentOwnerId: buyerId },
+       });
+       if (reserved.count !== 1) {
+@@ -2343,7 +2501,7 @@ export class PaymentsService {
+ 
+       const created = await tx.order.create({
+         data: {
+-          listingId: input.listingId,
++          listingId: p.listingId,
+           buyerId,
+           sellerId: listing.sellerId,
+           listingPrice: price,
+@@ -2355,20 +2513,21 @@ export class PaymentsService {
+           status: "PAYMENT_RECEIVED",
+           paymentStatus: "CAPTURED",
+           paymentMethod: "CRYPTO",
+-          transactionHash: input.signature,
+-          buyerWalletAddress: input.buyerAddress,
+-          sellerWalletAddress: sellerSolanaWallet,
+-          tokenSymbol: `${input.token}_SOLANA_${config.cluster.toUpperCase()}`,
++          transactionHash: p.signature,
++          buyerWalletAddress: p.payerAddress,
++          sellerWalletAddress: p.sellerWallet,
++          tokenSymbol: p.tokenSymbol,
++          ...(p.chainId ? { chainId: p.chainId } : {}),
+           paidAt: new Date(),
+-          ...(input.shippingAddress
+-            ? { shippingAddress: encryptPII(input.shippingAddress) as never }
++          ...(p.encryptedShippingAddress
++            ? { shippingAddress: p.encryptedShippingAddress as never }
+             : {}),
+         },
+       });
+ 
+       await tx.ownershipHistory.create({
+         data: {
+-          listingId: input.listingId,
++          listingId: p.listingId,
+           ownerId: buyerId,
+           ownerUsername: buyer?.username ?? null,
+           acquiredFrom: listing.seller?.username ?? null,
+@@ -2383,16 +2542,27 @@ export class PaymentsService {
+           userId: listing.sellerId,
+           type: "ORDER_UPDATE" as never,
+           title: "New sale",
+-          body: "Your item sold through a verified Solana USDC payment. Prepare it for shipment.",
++          body: p.saleNote,
+           data: {
+-            listingId: input.listingId,
++            listingId: p.listingId,
+             orderId: created.id,
+-            txHash: input.signature,
++            txHash: p.signature,
+           } as never,
+         },
+       });
+ 
+       if (intent) {
++        // A provider-delivered payment (NEAR Intents) has no client-submitted
++        // hash, so the receipt is bound to its checkout here. receiptKey is
++        // unique: one delivery can never settle two checkouts.
++        if (p.bindReceipt)
++          await tx.checkoutIntent.update({
++            where: { id: intent.id },
++            data: {
++              transactionHash: p.signature,
++              receiptKey: `${intent.cluster}:${p.signature}`,
++            },
++          });
+         await this.checkout!.complete(tx, intent.id);
+         await this.queuePassport(
+           tx,
+@@ -2409,8 +2579,8 @@ export class PaymentsService {
+       .notifyAdmins(
+         "ORDER_UPDATE",
+         "New Solana crypto order",
+-        `Solana USDC order placed. Listing: ${input.listingId}`,
+-        { listingId: input.listingId, buyerId, sellerId: listing.sellerId },
++        `Solana USDC order placed. Listing: ${p.listingId}`,
++        { listingId: p.listingId, buyerId, sellerId: listing.sellerId },
+       )
+       .catch(() => {});
+ 
+diff --git a/apps/api/src/modules/payments/verify-onchain.ts b/apps/api/src/modules/payments/verify-onchain.ts
+index 05e255f..fe59c11 100644
+--- a/apps/api/src/modules/payments/verify-onchain.ts
++++ b/apps/api/src/modules/payments/verify-onchain.ts
+@@ -46,6 +46,12 @@ export async function verifyOnChainPayment(opts: {
+   escrowOrderId?: string; // unused for direct transfers, kept for API compat
+   reference?: string;
+   amountBaseUnits?: string;
++  /**
++   * Check only that the seller received the USDC, not who sent it. For NEAR
++   * Intents deliveries, which come from a solver, never the buyer. Safe ONLY
++   * for a hash the server obtained from the provider for a quote it created.
++   */
++  receiptOnly?: boolean;
+ }): Promise<VerifyResult> {
+   const { txHash, chainId, token, sellerAddress, priceUsd, buyerAddress } =
+     opts;
+@@ -80,7 +86,7 @@ export async function verifyOnChainPayment(opts: {
+   }
+ 
+   const tokenAddress = getAddress(expectedTokenAddress);
+-  if (!buyer || buyer === seller)
++  if (!opts.receiptOnly && (!buyer || buyer === seller))
+     return { ok: false, reason: "Invalid payment parties" };
+   let need: bigint;
+   try {
+@@ -98,7 +104,7 @@ export async function verifyOnChainPayment(opts: {
+     if (await receipt.confirmations() < 2) return { ok: false, reason: "Waiting for payment confirmations" };
+     if (receipt.status !== 1)
+       return { ok: false, reason: "Transaction reverted / failed" };
+-    if (opts.reference) {
++    if (!opts.receiptOnly && opts.reference) {
+       const transaction = await provider.getTransaction(txHash);
+       if (
+         !transaction ||
+@@ -132,7 +138,7 @@ export async function verifyOnChainPayment(opts: {
+       const value = BigInt(parsed.args.value);
+ 
+       if (to !== seller) continue;
+-      if (buyer && from !== buyer) continue;
++      if (!opts.receiptOnly && buyer && from !== buyer) continue;
+       if (value >= need) return { ok: true };
+     }
+ 
+diff --git a/apps/api/src/modules/payments/verify-solana.ts b/apps/api/src/modules/payments/verify-solana.ts
+index 7bc6e1d..3e7b2a0 100644
+--- a/apps/api/src/modules/payments/verify-solana.ts
++++ b/apps/api/src/modules/payments/verify-solana.ts
+@@ -271,6 +271,15 @@ export async function verifySolanaUsdcPayment(opts: {
+   buyerAddress: string;
+   sellerAddress: string;
+   priceUsd: number;
++  /**
++   * Check only that the seller received the USDC, not who sent it.
++   *
++   * A NEAR Intents payment is delivered by a solver, never by the buyer, so
++   * the buyer neither signs the delivery nor loses USDC in it. This is safe
++   * ONLY for a signature the server obtained itself from the provider for a
++   * quote it created; never set it for a signature a client supplied.
++   */
++  receiptOnly?: boolean;
+ }): Promise<VerifySolanaResult> {
+   const { cluster, rpcUrl } = getSolanaConfig();
+   if (process.env.SOLANA_PAYMENTS_ENABLED !== "true") {
+@@ -282,7 +291,7 @@ export async function verifySolanaUsdcPayment(opts: {
+ 
+   const solanaAddressPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+   if (
+-    !solanaAddressPattern.test(opts.buyerAddress) ||
++    (!opts.receiptOnly && !solanaAddressPattern.test(opts.buyerAddress)) ||
+     !solanaAddressPattern.test(opts.sellerAddress)
+   ) {
+     return { ok: false, reason: "Invalid Solana wallet address" };
+@@ -331,6 +340,7 @@ export async function verifySolanaUsdcPayment(opts: {
+     }
+ 
+     if (
++      !opts.receiptOnly &&
+       opts.reference &&
+       !transaction.transaction.message.instructions?.some(
+         (ix) =>
+@@ -374,7 +384,7 @@ export async function verifySolanaUsdcPayment(opts: {
+     const buyerSigned = transaction.transaction.message.accountKeys.some(
+       (account) => account.signer && account.pubkey === opts.buyerAddress,
+     );
+-    if (!buyerSigned) {
++    if (!opts.receiptOnly && !buyerSigned) {
+       return {
+         ok: false,
+         reason: "Buyer wallet did not sign this transaction",
+@@ -386,7 +396,7 @@ export async function verifySolanaUsdcPayment(opts: {
+         reason: "No matching USDC transfer to the seller's verified wallet",
+       };
+     }
+-    if (buyerDecrease < requiredAmount) {
++    if (!opts.receiptOnly && buyerDecrease < requiredAmount) {
+       return {
+         ok: false,
+         reason: "USDC was not transferred from the connected buyer wallet",
+diff --git a/apps/api/vercel.json b/apps/api/vercel.json
+index a2041cb..d24ddd1 100644
+--- a/apps/api/vercel.json
++++ b/apps/api/vercel.json
+@@ -31,6 +31,10 @@
+     {
+       "path": "/api/v1/passports/cron/delivery",
+       "schedule": "15 9 * * *"
++    },
++    {
++      "path": "/api/v1/near-intents/cron/reconcile",
++      "schedule": "*/5 * * * *"
+     }
+   ]
+ }
+diff --git a/apps/web/src/app/(account)/selling/selling-dashboard.tsx b/apps/web/src/app/(account)/selling/selling-dashboard.tsx
+index 58254a4..b26ddb7 100644
+--- a/apps/web/src/app/(account)/selling/selling-dashboard.tsx
++++ b/apps/web/src/app/(account)/selling/selling-dashboard.tsx
+@@ -669,9 +669,29 @@ export function SellingDashboard({
+               Add tracking after handing the parcel to the carrier. Shipping
+               labels are purchased separately.
+             </p>
+-            <Link className="text-sm underline" href="/selling/fulfillment">
+-              Redeemed item shipments ↗
+-            </Link>
++            <span className="flex flex-wrap items-center gap-4">
++              {/* Sales paid from another chain, for the seller's accountant. */}
++              <button
++                className="text-sm underline"
++                onClick={() =>
++                  api
++                    .download(
++                      "/near-intents/sales.csv",
++                      "port66-intents-sales.csv",
++                    )
++                    .catch(() =>
++                      setShippingMessage(
++                        "Could not download the export. Try again in a moment.",
++                      ),
++                    )
++                }
++              >
++                Export cross-chain sales (CSV)
++              </button>
++              <Link className="text-sm underline" href="/selling/fulfillment">
++                Redeemed item shipments ↗
++              </Link>
++            </span>
+           </div>
+           {shippingMessage && (
+             <p role="status" className="sell-card p-4 text-sm">
+diff --git a/apps/web/src/app/api/agent/v1/route.ts b/apps/web/src/app/api/agent/v1/route.ts
+index edf58f9..b79e785 100644
+--- a/apps/web/src/app/api/agent/v1/route.ts
++++ b/apps/web/src/app/api/agent/v1/route.ts
+@@ -11,6 +11,9 @@ const BASE = "https://port66.xyz/api/agent/v1";
+ // so it is listed here explicitly: an agent that reads only this manifest
+ // would otherwise never learn the one surface it can call for nothing.
+ const SKUS = "https://port66.xyz/api/v1/tokenized-skus";
++const API = "https://port66.xyz/api/v1";
++const MUSE = "https://port66.xyz/api/muse/v1";
++const MCP = "https://port66.xyz/api/mcp";
+ 
+ export async function GET() {
+   return NextResponse.json({
+@@ -28,12 +31,23 @@ export async function GET() {
+       scheme: "exact",
+       options: [
+         { network: X402_NETWORK, currency: "USDC", payTo: X402_PAY_TO },
+-        { network: X402_SOLANA_NETWORK, currency: "USDC", payTo: X402_SOLANA_PAY_TO },
++        ...(X402_SOLANA_PAY_TO
++          ? [{ network: X402_SOLANA_NETWORK, currency: "USDC", payTo: X402_SOLANA_PAY_TO }]
++          : []),
+       ],
+     },
+     trust: {
+       provider: "Valiron",
+-      requiredIdentityHeaders: ["X-Agent-Id", "X-Agent-Address"],
++      requiredIdentityHeaders: [
++        "X-Agent-Address",
++        "X-Agent-Timestamp",
++        "X-Agent-Nonce",
++        "X-Agent-Request-Signature",
++      ],
++      requestProof:
++        "EIP-191 signature by X-Agent-Address over valiron-wallet-request-v2 " +
++        "(agent, chain, method, url, body-sha256, timestamp, nonce), one nonce " +
++        "per request, 60-second window. Details: https://port66.xyz/llms.txt",
+       minimumScore: 65,
+       flow: ["valiron-trust-check", "x402-payment", "api-access"],
+       // Scoped so the gate is not read as covering the whole API. Endpoints
+@@ -47,11 +61,52 @@ export async function GET() {
+         price: "free",
+         description: "This manifest.",
+       },
++      // Free first: an agent deciding whether Port66 has what it needs should
++      // not have to pay, or prove its identity, just to look.
++      {
++        method: "GET",
++        url: `${MUSE}/search`,
++        price: "free",
++        auth: "none",
++        description:
++          "Search active listings: title, brand, condition, size, price, " +
++          "authenticity level, image and link. Free, no identity, no payment.",
++        queryParams: {
++          query: "words in the title (one or two words match best)",
++          brand: "brand name",
++          category: "category name",
++          size: "size",
++          color: "color",
++          min_price: "minimum price (USD)",
++          max_price: "maximum price (USD)",
++          limit: "results (max 20)",
++        },
++      },
++      {
++        method: "GET",
++        url: `${MUSE}/listings/{id}`,
++        price: "free",
++        auth: "none",
++        description:
++          "One listing in full: description, condition, provenance record and " +
++          "how to buy it. Free, no identity, no payment.",
++      },
++      {
++        method: "POST",
++        url: MCP,
++        price: "free",
++        auth: "none to browse; Port66 session to buy",
++        description:
++          "Model Context Protocol server (streamable HTTP): search, inspect, " +
++          "price in any crypto, buy from any chain and negotiate, as tools.",
++      },
+       {
+         method: "GET",
+         url: `${BASE}/listings`,
+         price: "$0.005",
+-        description: "Search and browse active marketplace listings.",
++        description:
++          "Paid variant of search with the full marketplace record. The free " +
++          "search above covers most needs.",
+         queryParams: {
+           q: "free-text search",
+           brandName: "filter by brand name",
+@@ -137,6 +192,43 @@ export async function GET() {
+           "against Base before any claim is recorded as minted.",
+       },
+     ],
++    // Buying marketplace listings, paid from any chain through NEAR Intents.
++    // Auth is a wallet sign-in (SIWE), the same session a person gets.
++    buyListings: {
++      description:
++        "Buy a marketplace listing paying in BTC, SOL, NEAR, ETH, USDC, USDT, " +
++        "DOGE or LTC. NEAR Intents delivers the exact USDC price to the " +
++        "seller and refunds the buyer on its own chain if the swap fails.",
++      auth:
++        "Sign-In with Ethereum: GET /api/auth/nonce, sign, POST /api/auth/verify " +
++        "-> Bearer token",
++      steps: [
++        { method: "GET", url: `${API}/near-intents/options`, note: "payable assets, free" },
++        {
++          method: "POST",
++          url: `${API}/near-intents/quote`,
++          body: "{ listingId, originAsset, refundTo, shippingAddress }",
++          note: "reserves the item; returns pay.depositAddress and pay.amountBaseUnits",
++        },
++        {
++          method: "POST",
++          url: `${API}/near-intents/checkouts/{id}/deposit`,
++          body: "{ txHash }",
++          note: "optional, after sending exactly pay.amountBaseUnits",
++        },
++        {
++          method: "GET",
++          url: `${API}/near-intents/checkouts/{id}`,
++          note: "poll until state is paid (orderId set), refunded, failed or expired",
++        },
++      ],
++      negotiate: {
++        offer: `${API}/listings/{id}/offer`,
++        status: `${API}/near-intents/offers/{listingId}`,
++        note: "An accepted offer prices the next quote at the agreed amount.",
++      },
++      referenceAgent: "Port66 repository, apps/buyer-agent",
++    },
+     // Writes are documented but not enumerated as callable endpoints: they need
+     // a merchant API key, so an anonymous agent reading this manifest cannot use
+     // them. Pointing at the docs is honest; listing them as available is not.
+@@ -169,8 +261,8 @@ export async function GET() {
+     // Agent purchase of tokenized inventory is LIVE (see /skus above); it is
+     // marketplace listings that still have no agent purchase path.
+     roadmap:
+-      "Agents can buy tokenized inventory today via /skus. Planned: agent " +
+-      "offers and purchase on marketplace listings.",
++      "Agents can buy tokenized inventory via /skus and marketplace listings " +
++      "from any chain via buyListings (NEAR Intents), including offers.",
+     openapi: "https://port66.xyz/openapi.json",
+     discovery: "https://port66.xyz/.well-known/x402",
+     website: "https://port66.xyz",
+diff --git a/apps/web/src/app/llms.txt/route.ts b/apps/web/src/app/llms.txt/route.ts
+index abc8ba7..a557cd6 100644
+--- a/apps/web/src/app/llms.txt/route.ts
++++ b/apps/web/src/app/llms.txt/route.ts
+@@ -15,7 +15,22 @@ assert authenticity or ownership beyond what those records contain.
+ 
+ ## Free, unauthenticated API
+ 
+-No account, no trust check, no payment:
++No account, no trust check, no payment.
++
++Marketplace listings (luxury, streetwear, collectibles):
++
++- GET https://port66.xyz/api/muse/v1/search
++  Query: query, brand, category, size, color, min_price, max_price, limit
++  (max 20). Lean results: price, condition, authenticity level, image, link.
++  Search matches words in the title; one or two words work best.
++- GET https://port66.xyz/api/muse/v1/listings/{id}
++  One listing in full, including provenance and how to buy it.
++
++MCP server: https://port66.xyz/api/mcp (streamable HTTP). Search, inspect,
++price in any crypto, buy from any chain and negotiate, as tools. Browsing
++needs no account; buying needs a Port66 session (see below).
++
++Tokenized inventory:
+ 
+ - GET https://port66.xyz/api/v1/tokenized-skus
+   Browse active tokenized SKUs. Query: status, merchantId, brandSlug, q, page,
+@@ -31,9 +46,27 @@ Example:
+ ## Paid API (x402)
+ 
+ Marketplace listing and market data are priced per call in USDC on Base
+-mainnet. Agents identify with X-Agent-Id and X-Agent-Address; a Valiron trust
+-score of 65 is required before a paid endpoint responds. Call without payment
+-to receive a 402 challenge stating amount, network and recipient.
++mainnet. A Valiron trust score of 65 is required before a paid endpoint
++responds, and the agent must prove it controls the identity it claims:
++
++- X-Agent-Address: your agent's EVM address (enrolled with Valiron,
++  https://valiron.co/auth.md). On-chain X-Agent-Id is not accepted yet.
++- X-Agent-Timestamp: now, in milliseconds (must be within 60 seconds)
++- X-Agent-Nonce: 24-128 random URL-safe characters, new for every request
++- X-Agent-Request-Signature: EIP-191 personal_sign by that address of
++
++    valiron-wallet-request-v2
++    agent:<X-Agent-Address exactly as sent>
++    chain:base
++    method:GET
++    url:<the full request URL, including the query string>
++    body-sha256:<hex SHA-256 of the body; e3b0c442...b855 for an empty body>
++    timestamp:<X-Agent-Timestamp>
++    nonce:<X-Agent-Nonce>
++
++A missing, stale, replayed or mismatched signature gets 401 with a code
++saying which. Then call without payment to receive a 402 challenge stating
++amount, network and recipient; sign afresh for the paid retry.
+ 
+ - GET https://port66.xyz/api/agent/v1 — capability manifest (free)
+ - GET https://port66.xyz/api/agent/v1/listings — $0.005
+@@ -84,6 +117,35 @@ API keys are scoped to the tokenized-SKU API and to the merchant that issued
+ them. A key cannot reach orders, payments or account settings, and cannot issue
+ further keys. Buying still requires a signed-in session.
+ 
++## Buying a marketplace listing from any chain (NEAR Intents)
++
++Agents can buy marketplace listings, paying in BTC, SOL, NEAR, ETH, USDC,
++USDT, DOGE or LTC. NEAR Intents delivers the exact USDC price to the seller
++(on Solana, or Base for sellers without a Solana wallet) and refunds the
++agent on its own chain if the swap cannot complete. Port66 never holds funds.
++
++1. Sign in with an EVM key (EIP-4361):
++   GET https://port66.xyz/api/auth/nonce -> { nonce, nonceJwt }
++   Sign the message "port66.xyz wants you to sign in with your Ethereum
++   account:" (standard SIWE fields, Chain ID 8453, that nonce), then
++   POST https://port66.xyz/api/auth/verify { message, signature, nonceJwt }
++   -> { token }. Send it as Authorization: Bearer <token>.
++2. GET https://port66.xyz/api/v1/near-intents/options — payable assets (free).
++3. POST https://port66.xyz/api/v1/near-intents/quote
++   { listingId, originAsset, refundTo, shippingAddress } — reserves the item
++   and returns pay.depositAddress and pay.amountBaseUnits.
++4. Send exactly pay.amountBaseUnits of the asset to pay.depositAddress, then
++   optionally POST .../near-intents/checkouts/{id}/deposit { txHash }.
++5. Poll GET .../near-intents/checkouts/{id} until state is "paid" (orderId
++   set), or "refunded" / "failed" / "expired".
++
++Negotiating: POST https://port66.xyz/api/v1/listings/{id}/offer
++{ amount, message }. GET .../near-intents/offers/{listingId} reports when the
++seller accepts; the next quote is then priced at the agreed amount.
++
++A reference agent (budget, one counter-offer, receipts) is in the Port66
++repository under apps/buyer-agent.
++
+ ## Specifications
+ 
+ - OpenAPI: https://port66.xyz/openapi.json
+diff --git a/apps/web/src/components/marketplace/crypto-payment-modal.tsx b/apps/web/src/components/marketplace/crypto-payment-modal.tsx
+index 59fa491..e2c132c 100644
+--- a/apps/web/src/components/marketplace/crypto-payment-modal.tsx
++++ b/apps/web/src/components/marketplace/crypto-payment-modal.tsx
+@@ -34,6 +34,7 @@ import {
+ import { BasePayButton } from "./base-pay-button";
+ import { PayCard } from "./pay-card";
+ import { NetworkMark } from "./network-mark";
++import { NearIntentsPayStep, type IntentAsset } from "./near-intents-pay-step";
+ 
+ interface ListingWithSellerWallet extends Listing {
+   seller: Listing["seller"] & {
+@@ -64,6 +65,7 @@ type PaymentStep =
+   | "bridge"
+   | "wallet-pay"
+   | "solana-pay"
++  | "intents-pay"
+   | "success";
+ 
+ // Fallback origin chains, used only until /tokenized-skus/payment-options
+@@ -839,7 +841,26 @@ export function CryptoPaymentModal({
+ 
+   const [step, setStep] = useState<PaymentStep>(initialStep);
+   const [paymentError, setPaymentError] = useState<string | null>(null);
+-  const [completedRail, setCompletedRail] = useState<"base" | "solana">("base");
++  const [completedRail, setCompletedRail] = useState<
++    "base" | "solana" | "intents"
++  >("base");
++  // NEAR Intents: pay in BTC, SOL, NEAR, ETH... the seller gets USDC on Solana.
++  const [intentAssets, setIntentAssets] = useState<IntentAsset[]>([]);
++  useEffect(() => {
++    let active = true;
++    capabilityApi.current
++      .get<{ enabled?: boolean; assets?: IntentAsset[] }>(
++        "/near-intents/options",
++      )
++      .then((options) => {
++        if (active && options?.enabled && Array.isArray(options.assets))
++          setIntentAssets(options.assets);
++      })
++      .catch(() => {});
++    return () => {
++      active = false;
++    };
++  }, []);
+   const [solanaSandbox, setSolanaSandbox] = useState(false);
+   // Cross-chain (Across) pay-from-any-chain support.
+   const [bridgeEnabled, setBridgeEnabled] = useState(false);
+@@ -920,12 +941,20 @@ export function CryptoPaymentModal({
+     serverSolana &&
+     !!sellerSolanaWallet &&
+     !isGroup;
+-  const hasPaymentRoute = !!sellerWallet || solanaEnabled;
++  // The seller is paid in USDC on Solana, or on Base when they have no
++  // Solana wallet; one listing per delivery, so a bag is not covered.
++  const intentsEnabled =
++    intentAssets.length > 0 &&
++    (!!sellerSolanaWallet || !!sellerWallet) &&
++    !isGroup;
++  const hasPaymentRoute = !!sellerWallet || solanaEnabled || intentsEnabled;
+   const isBase = chainId === base.id;
+   const paymentContext =
+     step === "solana-pay"
+       ? "Solana"
+-      : step === "wallet-pay"
++      : step === "intents-pay"
++        ? "Any chain · NEAR Intents"
++        : step === "wallet-pay"
+         ? "Connected wallet · Base"
+         : bridgeEnabled
+           ? // Say what the buyer gets, not which networks are plumbed in.
+@@ -1394,6 +1423,39 @@ export function CryptoPaymentModal({
+                   <div className="border-t border-[var(--dsc-rule-soft)]" />
+                 )}
+ 
++                {intentsEnabled && (
++                  <button
++                    onClick={() => {
++                      setPaymentError(null);
++                      setStep("intents-pay");
++                    }}
++                    className="flex w-full items-center gap-4 border-b border-[var(--dsc-rule-soft)] py-5 text-left transition-opacity hover:opacity-60"
++                  >
++                    <NetworkMark name="NEAR" />
++                    <span className="min-w-0 flex-1">
++                      <span className="block text-[13px] font-semibold text-[var(--dsc-ink)]">
++                        Pay from any chain
++                      </span>
++                      <span className="mt-0.5 block text-[11px] text-[var(--dsc-ink-2)]">
++                        {intentAssets
++                          .map((a) => a.symbol)
++                          .filter((sym, i, all) => all.indexOf(sym) === i)
++                          .slice(0, 4)
++                          .join(", ")}{" "}
++                        and more · no wallet to connect · NEAR Intents
++                      </span>
++                    </span>
++                    <span className="text-right">
++                      <span className="block text-[13px] font-semibold tabular-nums text-[var(--dsc-ink)]">
++                        {usdcAmount}
++                      </span>
++                      <span className="mt-0.5 block text-[9px] uppercase tracking-[0.16em] text-[var(--dsc-ink-2)]">
++                        + routing
++                      </span>
++                    </span>
++                  </button>
++                )}
++
+                 {solanaEnabled && (
+                   <button
+                     onClick={() => setStep("solana-pay")}
+@@ -1583,6 +1645,31 @@ export function CryptoPaymentModal({
+           </div>
+         )}
+ 
++        {step === "intents-pay" && intentsEnabled && (
++          <NearIntentsPayStep
++            listingId={listing.id}
++            usdcAmount={usdcAmount}
++            assets={intentAssets}
++            shippingAddress={{
++              name: ship.name.trim(),
++              line1: ship.line1.trim(),
++              line2: ship.line2.trim(),
++              city: ship.city.trim(),
++              region: ship.region.trim(),
++              postal: ship.postal.trim(),
++              country: ship.country.trim(),
++              phone: ship.phone.trim(),
++            }}
++            evmAddress={address}
++            settlementChain={sellerSolanaWallet ? "Solana" : "Base"}
++            onPaid={() => {
++              setCompletedRail("intents");
++              setStep("success");
++            }}
++            onBack={() => setStep("review")}
++          />
++        )}
++
+         {/* Step: success */}
+         {step === "success" && (
+           <div className="space-y-6 p-6">
+@@ -1594,7 +1681,9 @@ export function CryptoPaymentModal({
+                 Payment complete
+               </h3>
+               <p className="mt-2 text-[12px] leading-relaxed text-[var(--dsc-ink-2)]">
+-                {completedRail === "solana"
++                {completedRail === "intents"
++                  ? `Paid from another chain through NEAR Intents. The seller received USDC on ${sellerSolanaWallet ? "Solana" : "Base"} and your order is now recorded.`
++                  : completedRail === "solana"
+                   ? solanaSandbox
+                     ? "USDC payment verified on Solana. No real listing or order was changed."
+                     : "USDC payment verified on Solana. Your order is now recorded."
+diff --git a/apps/web/src/components/marketplace/network-mark.tsx b/apps/web/src/components/marketplace/network-mark.tsx
+index bb1d86f..e301cbe 100644
+--- a/apps/web/src/components/marketplace/network-mark.tsx
++++ b/apps/web/src/components/marketplace/network-mark.tsx
+@@ -24,6 +24,10 @@ const FILES: Record<string, string> = {
+   avalanche: "/chains/avalanche.png",
+   "bnb chain": "/chains/bnb.png",
+   bnb: "/chains/bnb.png",
++  near: "/chains/near.png",
++  bitcoin: "/chains/bitcoin.png",
++  dogecoin: "/chains/dogecoin.png",
++  litecoin: "/chains/litecoin.png",
+   usdc: "/chains/usdc.png",
+   usdt: "/chains/usdt.png",
+ };
+diff --git a/apps/web/src/lib/api/client.ts b/apps/web/src/lib/api/client.ts
+index cd85c60..30a0623 100644
+--- a/apps/web/src/lib/api/client.ts
++++ b/apps/web/src/lib/api/client.ts
+@@ -142,5 +142,20 @@ export function useApiClient() {
+     patch: <T>(path: string, body: unknown) =>
+       apiFetch<T>(path, { method: "PATCH", body: JSON.stringify(body) }),
+     delete: <T>(path: string) => apiFetch<T>(path, { method: "DELETE" }),
++    /** Fetch a file (e.g. a CSV export) with the session and save it. */
++    download: async (path: string, filename: string) => {
++      const token = await getToken();
++      const res = await fetch(`${API_URL}${path}`, {
++        headers: token ? { Authorization: `Bearer ${token}` } : {},
++      });
++      if (res.status === 401) purgeStaleWalletSession(token);
++      if (!res.ok) throw new ApiError(`Download failed (${res.status})`, res.status, null);
++      const url = URL.createObjectURL(await res.blob());
++      const link = document.createElement("a");
++      link.href = url;
++      link.download = filename;
++      link.click();
++      setTimeout(() => URL.revokeObjectURL(url), 1000);
++    },
+   };
+ }
+diff --git a/apps/web/src/lib/muse/catalog.ts b/apps/web/src/lib/muse/catalog.ts
+index c7b930a..61baf22 100644
+--- a/apps/web/src/lib/muse/catalog.ts
++++ b/apps/web/src/lib/muse/catalog.ts
+@@ -94,9 +94,9 @@ export function toDetail(l: MarketListing) {
+       checkout_url: `${SITE}/listing/${encodeURIComponent(l.slug)}`,
+       payment_methods: [
+         "USDC on Base",
+-        "Crypto from Ethereum, Arbitrum, Polygon, Avalanche, BNB Chain or Solana (converted to USDC)",
++        "Any of BTC, SOL, NEAR, ETH, USDC, USDT, DOGE or LTC from their own chain, through NEAR Intents (the seller receives exact USDC)",
+       ],
+-      note: "Purchases are completed by the buyer on port66.xyz.",
++      note: "Buy on port66.xyz, or as an agent through https://port66.xyz/api/mcp or the steps in https://port66.xyz/llms.txt.",
+     },
+     listed_at: l.createdAt ?? null,
+   };
+diff --git a/pnpm-workspace.yaml b/pnpm-workspace.yaml
+index 3ff5faa..4d5c742 100644
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -1,3 +1,6 @@
+ packages:
+   - "apps/*"
+   - "packages/*"
++  # The buyer agent is a standalone CLI with its own lockfile, so adding or
++  # updating its dependencies never re-resolves the web and API builds.
++  - "!apps/buyer-agent"
