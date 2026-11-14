@@ -114,3 +114,24 @@ What happens on each call:
 
 `--max <usd>` caps the price per call (default 0.05); `--base <url>` targets
 another deployment.
+
+## Port66's agent fleet
+
+Three agents owned by Port66 do real work through the paid API. Each has its
+own key (kept in `.fleet/`, git-ignored), its own Valiron identity and a
+per-run USDC budget:
+
+| Agent | Job | Output |
+|---|---|---|
+| `indexer` | Pages through every live listing | `.fleet/catalogue.json`, counts by brand, category and price band |
+| `scout` | Buyer-intent searches: top brands, deadstock, bags, sneakers | `.fleet/scout-shortlist.json`, best-priced matches per search |
+| `watcher` | Re-reads the most valuable listings | `.fleet/watcher-report.json`, price and availability changes since its last run |
+
+```bash
+pnpm agent fleet status                          # addresses and USDC balances
+AGENT_EVM_PAY_KEY=0x... pnpm agent fleet fund --each 0.05   # top up from a treasury (USDC + a little ETH on Base)
+pnpm agent fleet run --budget 0.05               # all three jobs; or: fleet run watcher
+```
+
+Every call is signed, scored by Valiron, paid in USDC on Base and reported to
+Valiron's call logs. These are Port66's own agents and are labelled as such.

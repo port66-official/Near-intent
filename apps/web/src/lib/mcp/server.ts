@@ -84,6 +84,15 @@ export async function handleMessage(
         return isNotification ? null : ok(id, {});
       case "tools/list":
         return ok(id, { tools: TOOLS.map(({ run: _run, ...tool }) => tool) });
+      // No resources, templates or prompts, but answer the lists empty rather
+      // than "method not found": directory scanners (ChatGPT's plugin review)
+      // probe them for widget metadata and treat an error as a failed scan.
+      case "resources/list":
+        return ok(id, { resources: [] });
+      case "resources/templates/list":
+        return ok(id, { resourceTemplates: [] });
+      case "prompts/list":
+        return ok(id, { prompts: [] });
       case "tools/call": {
         const name = String(req.params?.name ?? "");
         const tool = TOOLS.find((t) => t.name === name);
@@ -318,7 +327,9 @@ interface Tool {
   run: (args: Record<string, unknown>, ctx: McpContext) => Promise<Record<string, unknown>>;
 }
 
-const READ = { readOnlyHint: true, openWorldHint: true };
+// All three hints stated outright: ChatGPT's plugin review requires explicit
+// booleans for each, even where the MCP spec would infer a default.
+const READ = { readOnlyHint: true, destructiveHint: false, openWorldHint: true };
 const str = (description: string) => ({ type: "string", description });
 const PAY_WITH = str("What the buyer pays with: BTC, SOL, NEAR, ETH, USDC, USDT, DOGE or LTC");
 const CHAIN = str("Optional chain when the asset exists on several, e.g. Arbitrum for ETH");

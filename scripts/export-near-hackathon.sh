@@ -37,6 +37,11 @@ for f in $(git ls-files \
   apps/web/src/lib/mcp \
   apps/web/src/app/api/mcp \
   apps/web/src/lib/x402/agent-proof.ts \
+  apps/api/src/modules/shopping-agents \
+  "apps/web/src/app/(account)/agents" \
+  apps/web/src/components/agents \
+  apps/web/src/lib/agents.ts \
+  packages/database/migrations/manual/20261114_shopping_agents.sql \
   scripts/export-near-hackathon.sh \
   docs/near-hackathon.md); do
   copy "$f"
@@ -58,6 +63,8 @@ git diff "$BASELINE" HEAD -- \
   apps/web/src/app/llms.txt \
   apps/web/src/app/api/agent/v1 \
   apps/web/src/lib/muse/catalog.ts \
+  packages/database/schema.prisma \
+  apps/web/src/components/shell/desktop-rail.tsx \
   > "$OUT/integration.diff"
 
 cp docs/near-hackathon.md "$OUT/README.md"

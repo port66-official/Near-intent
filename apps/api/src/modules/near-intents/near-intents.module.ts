@@ -10,5 +10,6 @@ import { NearIntentsService } from "./near-intents.service";
   // PrismaService is also required by ClerkAuthGuard; there is no shared
   // PrismaModule, so each module provides it directly.
   providers: [NearIntentsService, PrismaService],
+  exports: [NearIntentsService],
 })
 export class NearIntentsModule {}

@@ -42,7 +42,7 @@ index 911da20..66a6446 100644
  # Optional Base-native ERC-1155 inventory claims. See docs/sku-tokenization-v1-plan.md.
  # BOTH flags default to false in EVERY environment. Nothing is minted, purchasable,
 diff --git a/apps/api/package.json b/apps/api/package.json
-index 22a1f6d..0f35789 100644
+index 22a1f6d..8a11c30 100644
 --- a/apps/api/package.json
 +++ b/apps/api/package.json
 @@ -13,6 +13,7 @@
@@ -53,23 +53,33 @@ index 22a1f6d..0f35789 100644
      "test:watch": "jest --watch",
      "test:solana-runtime": "node --no-experimental-require-module scripts/check-solana-runtime.cjs",
      "db:generate": "prisma generate",
+@@ -22,6 +23,7 @@
+   "dependencies": {
+     "@anthropic-ai/sdk": "^0.33.0",
+     "@clerk/backend": "^1.16.0",
++    "@coinbase/cdp-sdk": "1.51.0",
+     "@metaplex-foundation/mpl-core": "^1.10.0",
+     "@metaplex-foundation/umi": "^1.6.0",
+     "@metaplex-foundation/umi-bundle-defaults": "^1.6.0",
 diff --git a/apps/api/src/app.module.ts b/apps/api/src/app.module.ts
-index 1327a49..bf9e02c 100644
+index 1327a49..003008c 100644
 --- a/apps/api/src/app.module.ts
 +++ b/apps/api/src/app.module.ts
-@@ -16,6 +16,7 @@ import { SocialModule } from "./modules/social/social.module";
+@@ -16,6 +16,8 @@ import { SocialModule } from "./modules/social/social.module";
  import { BillboardModule } from "./modules/billboard/billboard.module";
  import { SearchModule } from "./modules/search/search.module";
  import { PaymentsModule } from "./modules/payments/payments.module";
 +import { NearIntentsModule } from "./modules/near-intents/near-intents.module";
++import { ShoppingAgentsModule } from "./modules/shopping-agents/shopping-agents.module";
  import { MessagingModule } from "./modules/messaging/messaging.module";
  import { TokensModule } from "./modules/tokens/tokens.module";
  import { FractionalModule } from "./modules/fractional/fractional.module";
-@@ -78,6 +79,7 @@ const redisTls = process.env.REDIS_TLS === "true";
+@@ -78,6 +80,8 @@ const redisTls = process.env.REDIS_TLS === "true";
      BillboardModule,
      SearchModule,
      PaymentsModule,
 +    NearIntentsModule,
++    ShoppingAgentsModule,
      MessagingModule,
      NotificationsModule,
      TokensModule,
@@ -577,10 +587,10 @@ index 7bc6e1d..3e7b2a0 100644
          ok: false,
          reason: "USDC was not transferred from the connected buyer wallet",
 diff --git a/apps/api/vercel.json b/apps/api/vercel.json
-index a2041cb..d24ddd1 100644
+index a2041cb..3b9be2c 100644
 --- a/apps/api/vercel.json
 +++ b/apps/api/vercel.json
-@@ -31,6 +31,10 @@
+@@ -31,6 +31,14 @@
      {
        "path": "/api/v1/passports/cron/delivery",
        "schedule": "15 9 * * *"
@@ -588,6 +598,10 @@ index a2041cb..d24ddd1 100644
 +    {
 +      "path": "/api/v1/near-intents/cron/reconcile",
 +      "schedule": "*/5 * * * *"
++    },
++    {
++      "path": "/api/v1/shopping-agents/cron/run",
++      "schedule": "*/30 * * * *"
      }
    ]
  }
@@ -1041,6 +1055,64 @@ index bb1d86f..e301cbe 100644
    usdc: "/chains/usdc.png",
    usdt: "/chains/usdt.png",
  };
+diff --git a/apps/web/src/components/shell/desktop-rail.tsx b/apps/web/src/components/shell/desktop-rail.tsx
+index 9e4230d..9b9368e 100644
+--- a/apps/web/src/components/shell/desktop-rail.tsx
++++ b/apps/web/src/components/shell/desktop-rail.tsx
+@@ -18,7 +18,7 @@ function matches(pathname: string, prefixes: string[]) {
+ }
+ 
+ // The house mark for Market and RWA, drawn to sit with the Figma icons.
+-function Bag({ size = 26 }: { size?: number }) {
++export function Bag({ size = 26 }: { size?: number }) {
+   return (
+     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+       <path d="M5 8h14l-1.2 11.2a1 1 0 0 1-1 .8H7.2a1 1 0 0 1-1-.8z" />
+@@ -26,7 +26,7 @@ function Bag({ size = 26 }: { size?: number }) {
+     </svg>
+   );
+ }
+-function Vault({ size = 26 }: { size?: number }) {
++export function Vault({ size = 26 }: { size?: number }) {
+   return (
+     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+       <rect x="3.5" y="4.5" width="17" height="15" rx="3" />
+@@ -35,7 +35,7 @@ function Vault({ size = 26 }: { size?: number }) {
+     </svg>
+   );
+ }
+-function Hanger({ size = 26 }: { size?: number }) {
++export function Hanger({ size = 26 }: { size?: number }) {
+   return (
+     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+       <path d="M12 8.5a2 2 0 1 1 2-2" />
+@@ -44,6 +44,18 @@ function Hanger({ size = 26 }: { size?: number }) {
+   );
+ }
+ 
++// A shopping agent: a small head with a signal, in the same 1.6 stroke.
++export function AgentMark({ size = 26 }: { size?: number }) {
++  return (
++    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
++      <rect x="4.5" y="7.5" width="15" height="11" rx="4" />
++      <path d="M12 7.5V5M10.5 4h3" />
++      <circle cx="9.5" cy="13" r="1" fill="currentColor" stroke="none" />
++      <circle cx="14.5" cy="13" r="1" fill="currentColor" stroke="none" />
++    </svg>
++  );
++}
++
+ /** Mounted in the root layout: shows the rail on the screens useHasRail lists. */
+ export function DesktopRailMount() {
+   return useHasRail() ? <DesktopRail /> : null;
+@@ -90,6 +102,7 @@ export function DesktopRail() {
+       dot: unreadCount > 0,
+     },
+     { href: "/messages", label: "Messages", icon: <FigmaChat size={26} />, on: matches(pathname, ["/messages"]) },
++    { href: "/agents", label: "Agents", icon: <AgentMark />, on: matches(pathname, ["/agents"]) },
+     { href: "/sell/chat", label: "Sell", icon: <Hanger />, on: matches(pathname, ["/sell", "/selling"]) },
+   ];
+   const profileOn = matches(pathname, ["/profile", "/passport", "/settings", "/orders", "/saved", "/closet"]);
 diff --git a/apps/web/src/lib/api/client.ts b/apps/web/src/lib/api/client.ts
 index cd85c60..30a0623 100644
 --- a/apps/web/src/lib/api/client.ts
@@ -1082,6 +1154,102 @@ index c7b930a..61baf22 100644
      },
      listed_at: l.createdAt ?? null,
    };
+diff --git a/packages/database/schema.prisma b/packages/database/schema.prisma
+index b70b0a0..5423cf5 100644
+--- a/packages/database/schema.prisma
++++ b/packages/database/schema.prisma
+@@ -356,6 +356,7 @@ model User {
+   receivedReviews  Review[]              @relation("ReviewReceiver")
+   reports          Report[]
+   savedSearches    SavedSearch[]
++  shoppingAgents   ShoppingAgent[]
+   viewHistory      ViewHistory[]
+   disputes         Dispute[]
+   authRequests     AuthenticationRequest[]
+@@ -3019,3 +3020,83 @@ model BillboardBid {
+   @@index([slot, day])
+   @@index([day, status])
+ }
++
++
++// ─────────────────────────────────────────────
++// SHOPPING AGENTS
++// A user's own agent: it searches and watches the marketplace inside the
++// user's rules and proposes matches; the user approves and pays from their
++// own wallet. Port66 never holds the user's money. Tables are additive
++// (migrations/manual/20261114_shopping_agents.sql) and are also created on
++// first use by the API.
++// ─────────────────────────────────────────────
++
++model ShoppingAgent {
++  id     String @id @default(cuid())
++  userId String
++  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
++
++  name           String
++  query          String
++  brandName      String?
++  size           String?
++  condition      String?
++  maxItemUsd     Decimal  @db.Decimal(12, 2)
++  dailyBudgetUsd Decimal  @db.Decimal(12, 2)
++  payWith        String[]
++  negotiate      Boolean  @default(false)
++  status         String   @default("ACTIVE") // ACTIVE | PAUSED
++  // Automatic buying: the agent pays from the user's own Coinbase Smart
++  // Wallet through a Base spend permission the user signed (daily cap
++  // enforced on chain), and ships to shipTo.
++  autoBuy         Boolean @default(false)
++  spendPermission Json?
++  buyerWallet     String?
++  shipTo          Json?
++  lastRunAt      DateTime?
++
++  createdAt DateTime @default(now())
++  updatedAt DateTime @updatedAt
++
++  matches ShoppingAgentMatch[]
++  events  ShoppingAgentEvent[]
++
++  @@index([userId])
++  @@index([status])
++}
++
++model ShoppingAgentMatch {
++  id      String        @id @default(cuid())
++  agentId String
++  agent   ShoppingAgent @relation(fields: [agentId], references: [id], onDelete: Cascade)
++
++  listingId String
++  priceUsd  Decimal @db.Decimal(12, 2)
++  // PENDING (awaiting the user) | OFFERED | BUYING (agent paid, settling)
++  // | DISMISSED | PURCHASED | FAILED | GONE
++  status     String  @default("PENDING")
++  reason     String
++  offerId    String?
++  checkoutId String?
++  payTx      String?
++
++  createdAt DateTime @default(now())
++  updatedAt DateTime @updatedAt
++
++  @@unique([agentId, listingId])
++  @@index([status])
++}
++
++model ShoppingAgentEvent {
++  id      String        @id @default(cuid())
++  agentId String
++  agent   ShoppingAgent @relation(fields: [agentId], references: [id], onDelete: Cascade)
++
++  kind    String // RUN | MATCH | SKIP | OFFER | PURCHASED | GONE | PAUSED | RESUMED
++  message String
++  data    Json?
++
++  createdAt DateTime @default(now())
++
++  @@index([agentId, createdAt])
++}
 diff --git a/pnpm-workspace.yaml b/pnpm-workspace.yaml
 index 3ff5faa..4d5c742 100644
 --- a/pnpm-workspace.yaml

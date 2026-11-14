@@ -133,3 +133,89 @@ export async function callPaidEndpoint(run: X402Run): Promise<X402Result> {
     body,
   };
 }
+
+// ── A long-lived paying client, for agents that make many calls ───────────────
+
+export interface PaidResponse<T = unknown> {
+  status: number;
+  body: T;
+  /** USDC actually paid for this call (0 if not charged). */
+  paidUsd: number;
+  paidTx?: string;
+}
+
+/**
+ * One agent identity calling Port66's paid API many times: enrols with
+ * Valiron once, signs every request afresh, pays each 402 within a per-run
+ * budget, and waits out Valiron's first evaluation of a new agent.
+ */
+export class X402Agent {
+  readonly account: PrivateKeyAccount;
+  private readonly http: x402HTTPClient;
+  private enrolled = false;
+  spentUsd = 0;
+  calls = 0;
+
+  constructor(
+    key: `0x${string}`,
+    private readonly opts: { budgetUsd: number; maxPerCallUsd?: number; say?: (line: string) => void },
+  ) {
+    this.account = privateKeyToAccount(key);
+    const client = new x402Client();
+    registerExactEvmScheme(client, { signer: this.account });
+    this.http = new x402HTTPClient(client);
+  }
+
+  get address() {
+    return this.account.address;
+  }
+
+  async enrol() {
+    if (this.enrolled) return;
+    const profile = await enrolWithValiron(this.account);
+    this.enrolled = true;
+    this.opts.say?.(`  Valiron: ${this.address} verified=${profile.verified} score=${profile.score ?? "pending"} tier=${profile.tier ?? "-"}`);
+  }
+
+  async get<T = unknown>(url: string): Promise<PaidResponse<T>> {
+    await this.enrol();
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(url, { headers: await proof(this.account, "GET", url) });
+      const body = await readBody(res);
+      this.calls++;
+      // A new agent is denied until Valiron finishes its first evaluation.
+      if (res.status === 403 && attempt < 4 && JSON.stringify(body).includes("pending")) {
+        this.opts.say?.("  Valiron is still evaluating this agent; waiting 30s.");
+        await new Promise((r) => setTimeout(r, 30_000));
+        continue;
+      }
+      if (res.status !== 402) return { status: res.status, body: body as T, paidUsd: 0 };
+
+      const required = this.http.getPaymentRequiredResponse((h) => res.headers.get(h), body);
+      const option = required.accepts.find((a) => a.network === "eip155:8453");
+      if (!option) throw new Error("No Base USDC payment option offered.");
+      const price = Number(option.amount) / 10 ** USDC_DECIMALS;
+      if (price > (this.opts.maxPerCallUsd ?? 0.05)) throw new Error(`Price ${price} USDC is above the per-call cap.`);
+      if (this.spentUsd + price > this.opts.budgetUsd + 1e-9)
+        throw new BudgetExhausted(`Budget ${this.opts.budgetUsd} USDC reached after ${this.spentUsd.toFixed(3)} USDC.`);
+
+      const payload = await this.http.createPaymentPayload({ ...required, accepts: [option] });
+      const paid = await fetch(url, {
+        headers: { ...(await proof(this.account, "GET", url)), ...this.http.encodePaymentSignatureHeader(payload) },
+      });
+      const paidBody = await readBody(paid);
+      this.calls++;
+      let paidTx: string | undefined;
+      try {
+        paidTx = this.http.getPaymentSettleResponse((h) => paid.headers.get(h))?.transaction;
+      } catch {
+        // Not settled: nothing was charged.
+      }
+      const charged = paid.ok && paidTx ? price : 0;
+      this.spentUsd += charged;
+      return { status: paid.status, body: paidBody as T, paidUsd: charged, paidTx };
+    }
+  }
+}
+
+export class BudgetExhausted extends Error {}

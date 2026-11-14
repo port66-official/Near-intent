@@ -7,12 +7,24 @@
  *   pnpm agent ledger [--csv]                  every receipt so far
  *   pnpm agent x402 [path] [--pay] [--times N] call Port66's paid API as a
  *                                              Valiron-verified agent (x402)
+ *   pnpm agent setup                           create a dedicated test buyer: keys in .env,
+ *                                              tight limits in agent.config.json
+ *   pnpm agent wallets                         the buyer's addresses and balances
+ *   pnpm agent fleet status                    Port66's agent fleet: addresses, USDC
+ *   pnpm agent fleet fund --each 0.05          top each agent up from AGENT_EVM_PAY_KEY
+ *   pnpm agent fleet run [indexer|scout|watcher] [--budget 0.05]
+ *                                              do the fleet's jobs through the paid API
  *
  * Options: --config <file> (default agent.config.json, else the example),
  *          --pay <SYMBOL>, --chain <name> (e.g. Arbitrum for ETH),
  *          --listing <slug> (skip search), --receipts <file>.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { Keypair } from "@solana/web3.js";
+import bs58 from "bs58";
+import { createPublicClient, erc20Abi, formatUnits, http as viemHttp } from "viem";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { arbitrum as arbChain, base as baseChain, mainnet as ethChain } from "viem/chains";
 import { resolve } from "node:path";
 import { OneClickClient } from "../../api/src/modules/near-intents/one-click.client";
 import { SETTLEMENTS } from "../../api/src/modules/near-intents/intent-assets";
@@ -32,6 +44,7 @@ import { Port66, type IntentCheckout } from "./port66.js";
 import { ReceiptBook, type Receipt } from "./receipts.js";
 import { payerFor, type Payer } from "./payers.js";
 import { callPaidEndpoint } from "./x402.js";
+import { Fleet, ROLES, type Role } from "./fleet.js";
 
 // ── arguments ────────────────────────────────────────────────────────────────
 
@@ -47,6 +60,8 @@ const positional = argv
   .filter((a, i, all) => !a.startsWith("--") && !all[i - 1]?.startsWith("--"));
 
 const here = resolve(new URL(".", import.meta.url).pathname, "..");
+// The test buyer's keys live in a git-ignored .env next to the agent.
+if (existsSync(resolve(here, ".env"))) process.loadEnvFile(resolve(here, ".env"));
 const configPath = option("config")
   ? resolve(option("config")!)
   : existsSync(resolve(here, "agent.config.json"))
@@ -410,11 +425,102 @@ async function x402(path: string) {
   }
 }
 
+// ── fleet: Port66's own agents doing real work through the paid API ──────────
+
+async function fleet(action: string | undefined, role: string | undefined) {
+  const f = new Fleet(resolve(here, ".fleet"), option("base") ?? "https://port66.xyz", say);
+  if (action === "status") {
+    for (const r of await f.balances()) say(`${r.role.padEnd(8)} ${r.address}  ${r.usdc} USDC on Base`);
+    return;
+  }
+  if (action === "fund") {
+    const key = process.env.AGENT_EVM_PAY_KEY?.trim();
+    if (!key) throw new Error("Set AGENT_EVM_PAY_KEY to the treasury key (holds USDC and a little ETH on Base).");
+    return f.fund(key as `0x${string}`, Number(option("each") ?? 0.05));
+  }
+  if (action === "run") {
+    const budget = Number(option("budget") ?? 0.05);
+    const roles = (role ? [role] : ROLES) as Role[];
+    for (const r of roles) {
+      if (!ROLES.includes(r)) throw new Error(`Unknown role ${r}. Roles: ${ROLES.join(", ")}`);
+      say(`\n${bold(`port66-${r}`)} (${f.address(r)}), budget ${budget} USDC`);
+      await f[r](budget);
+    }
+    say(`\nReports are in ${resolve(here, ".fleet")}.`);
+    return;
+  }
+  throw new Error("Usage: pnpm agent fleet status | fund [--each 0.05] | run [indexer|scout|watcher] [--budget 0.05]");
+}
+
+// ── setup: a dedicated, funded test buyer ────────────────────────────────────
+
+function setup() {
+  const envFile = resolve(here, ".env");
+  const configFile = resolve(here, "agent.config.json");
+  if (existsSync(envFile) && /AGENT_EVM_KEY=/.test(readFileSync(envFile, "utf8"))) {
+    say("A buyer already exists in .env; keeping its keys. Run: pnpm agent wallets");
+  } else {
+    const lines = [
+      "# Port66 test buyer agent. Private keys: never commit or share this file.",
+      `AGENT_EVM_KEY=${generatePrivateKey()}`,
+      `AGENT_EVM_PAY_KEY=${generatePrivateKey()}`,
+      `AGENT_SOLANA_KEY=${bs58.encode(Keypair.generate().secretKey)}`,
+      "",
+    ];
+    writeFileSync(envFile, lines.join("\n"), { flag: "a" });
+    chmodSync(envFile, 0o600);
+    say("Created the buyer's keys in .env (readable only by you).");
+  }
+  if (!existsSync(configFile)) {
+    const example = JSON.parse(readFileSync(resolve(here, "agent.config.example.json"), "utf8"));
+    writeFileSync(
+      configFile,
+      JSON.stringify(
+        { ...example, maxItemUsd: 10, dailyBudgetUsd: 25, maxRoutingPct: 5, payWith: ["USDC", "ETH", "SOL"], negotiation: { enabled: false, stretchPct: 0 } },
+        null,
+        2,
+      ),
+    );
+    say("Wrote agent.config.json: one item up to $10, $25 a day, pays with USDC, ETH or SOL. Set shipTo to a real address.");
+  }
+  process.loadEnvFile(envFile);
+}
+
+async function wallets() {
+  const evm = process.env.AGENT_EVM_KEY?.trim();
+  const pay = process.env.AGENT_EVM_PAY_KEY?.trim();
+  const sol = process.env.AGENT_SOLANA_KEY?.trim();
+  if (!evm || !pay) throw new Error("No buyer yet. Run: pnpm agent setup");
+  say(`Port66 account (sign-in only, holds nothing): ${privateKeyToAccount(evm as `0x${string}`).address}`);
+  const payAddr = privateKeyToAccount(pay as `0x${string}`).address;
+  say(`\nEVM spending wallet: ${payAddr}  (fund with USDC or ETH on Base, Arbitrum or Ethereum)`);
+  const USDC: Record<string, `0x${string}`> = {
+    Base: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    Arbitrum: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    Ethereum: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+  };
+  for (const [name, chain] of [["Base", baseChain], ["Arbitrum", arbChain], ["Ethereum", ethChain]] as const) {
+    const reader = createPublicClient({ chain, transport: viemHttp(process.env[`AGENT_${name.toUpperCase()}_RPC`]) });
+    const [eth, usdc] = await Promise.all([
+      reader.getBalance({ address: payAddr }),
+      reader.readContract({ address: USDC[name], abi: erc20Abi, functionName: "balanceOf", args: [payAddr] }),
+    ]).catch(() => [0n, 0n] as const);
+    say(`  ${name.padEnd(9)} ${formatUnits(eth, 18).slice(0, 10)} ETH   ${formatUnits(usdc, 6)} USDC`);
+  }
+  if (sol) {
+    const wallet = Keypair.fromSecretKey(bs58.decode(sol));
+    say(`\nSolana spending wallet: ${wallet.publicKey.toBase58()}  (fund with SOL)`);
+  }
+}
+
 async function main() {
   if (command === "custody") return custody(loadMandate());
   if (command === "ledger") return ledger();
   if (command === "buy" && positional.length) return void (await buy(positional.join(" ")));
   if (command === "x402") return x402(positional[0] ?? "/api/agent/v1/listings?limit=3");
+  if (command === "fleet") return fleet(positional[0], positional[1]);
+  if (command === "setup") return void (setup(), await wallets());
+  if (command === "wallets") return wallets();
   say(readFileSync(new URL(import.meta.url), "utf8").split("*/")[0].replace(/^\/\*\*?/, "").replace(/^ \* ?/gm, "").trim());
   process.exitCode = command ? 1 : 0;
 }

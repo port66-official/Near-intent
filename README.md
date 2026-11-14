@@ -4,7 +4,24 @@
 
 The feature is live on port66.xyz: open a listing, choose **Buy with USDC**, then **Pay from any chain**.
 
-**Tracks:** Real-World Money (primary), Agent Economy.
+On top of it we built **shopping agents that buy on their own**: you tell an agent what you want and the most you will pay, approve a daily USDC cap once in a Coinbase wallet, and the agent finds the piece, pays through NEAR Intents and places the order with no checkout and no clicks. The cap is enforced on chain, not by Port66.
+
+**Tracks:** Agent Economy (primary), Real-World Money.
+
+## Watch an agent buy on port66.xyz
+
+Needs a Coinbase Smart Wallet (created in the popup with a passkey) holding a few USDC on Base.
+
+| Do | See |
+|---|---|
+| 1. Sign in at port66.xyz, open **Agents**, click **New agent**, type `Monaco Racing Club Tee`, set the price limit to 7 and click **Start agent**. | The agent page, with matching pieces listed and a **Created to look for…** entry in Activity. |
+| 2. In **Let it buy for you**, click **Set up**, enter a daily amount and a delivery address, then **Connect wallet and allow**. | Coinbase's **Allow Spend Permission** popup: "Transfer up to 7.00 USDC a day". After approving, the box reads **Buys for you automatically** with your wallet address. |
+| 3. Send a little more than the price in USDC on Base to that wallet, then click **Search now**. | Activity shows **Bought "…": paid 6.06 USDC from your wallet** with a **View payment** link to Basescan, and the piece moves to **Found and bought**. |
+| 4. Click **Search now** again a minute later. | The order completes once NEAR Intents has paid the seller, and appears under **Orders**. |
+
+The agent never buys your own listings, never pays above your limits, and can be switched off with **Turn off** (or by revoking the permission in the wallet).
+
+
 
 ## Try it in two minutes: no keys, no wallet, no funds
 
@@ -62,7 +79,35 @@ Port66 verifies the delivery on chain ──> order recorded, item marked sold
 - **Optional platform fee** inside the same intent (`appFees`): the seller still receives the exact price.
 - **Sellers export their cross-chain sales as CSV** from the Sales tab, one row per order with the on-chain receipt.
 
-### 2. Buyer agent (`apps/buyer-agent`)
+### 2. Shopping agents that pay on their own
+`apps/api/src/modules/shopping-agents`, `apps/web/src/app/(account)/agents`, `apps/web/src/components/agents/auto-buy-card.tsx`
+
+```
+user: "Monaco Racing Club Tee, up to $7"  +  signs a Base spend permission once
+   │                                         ("Port66's agent may spend 7 USDC a day")
+   ▼
+agent (every 30 min, or "Search now") ── searches live listings, applies the rules:
+   │       per-item limit, daily budget, never the user's own listings, one offer
+   │       at the limit when the asking price is up to 15% above it
+   ▼
+NEAR Intents 1Click ── reserves the piece and quotes EXACT_OUTPUT:
+   │                   the seller's price in USDC, paid from USDC on Base
+   ▼
+one user operation from a Coinbase CDP smart account, atomically:
+   │   SpendPermissionManager.spend (user's wallet → spender)
+   │   + USDC.transfer (spender → the one-time NEAR Intents deposit address)
+   ▼
+NEAR Intents delivers the exact price to the seller ──> Port66 verifies on chain,
+                                                        records the order
+```
+
+- **The user's money stays in the user's wallet** until a purchase. The daily cap is enforced on chain by Coinbase's SpendPermissionManager (`0xf85210B2…9b67Ad`), whatever Port66's server does, and the user can revoke it at any time.
+- **Atomic, so Port66 never holds funds:** pulling from the user's wallet and paying the NEAR Intents deposit address happen in one user operation. If either step fails, both revert.
+- **Checks before money moves:** the wallet's USDC balance (a short balance becomes an "add USDC" notice, not a failed purchase), the live route cost (at most 5% over the price), and the permission's remaining allowance for today.
+- **One purchase per piece:** a unique (agent, listing) row is the lock, so two overlapping runs cannot buy twice.
+- **Every step is in the agent's Activity**, with a Basescan link for each payment. The rules are pure functions (`shopping-agent.rules.ts`) with tests in `shopping-agents.spec.ts`.
+
+### 3. Buyer agent (`apps/buyer-agent`)
 An AI buying agent that shops Port66 inside an owner's mandate and pays through the same checkout. See its [README](apps/buyer-agent/README.md).
 
 - **Owner's rules** in one file: per-item ceiling, daily budget, routing-cost limit, allowed assets, minimum seller rating, and a **kill switch**. The rules are pure functions (`src/mandate.ts`) with no network, keys or model, and are fully tested.
@@ -72,7 +117,7 @@ An AI buying agent that shops Port66 inside an owner's mandate and pays through 
 - **A receipt for every task**, including the ones where it bought nothing: what, from whom, at what price, and whether its own post-purchase check passed.
 - **Optional NEAR AI Cloud** reads the task and writes the counter-offer. It never decides whether to pay; without a key, built-in rules do both.
 
-### 3. MCP server: the marketplace as tools
+### 4. MCP server: the marketplace as tools
 `apps/web/src/lib/mcp/server.ts`, served at **https://port66.xyz/api/mcp** (streamable HTTP, stateless).
 
 Any MCP client can connect by URL, with nothing to install:
@@ -93,7 +138,7 @@ claude mcp add --transport http port66 https://port66.xyz/api/mcp
 
 The server never holds or moves money. Buying tools return where to pay, and the agent's own wallet decides whether to.
 
-### 4. Agent discovery
+### 5. Agent discovery
 `port66.xyz/llms.txt` and the `/api/agent/v1` manifest now lead with the free catalogue and the MCP server, and explain how any agent can buy a listing this way: sign in with an EVM key, quote, pay, poll.
 
 ## Mainnet proof
@@ -111,7 +156,18 @@ NEAR Intents has no testnet, so the checkout was built against mainnet with dry-
 curl "https://1click.chaindefuser.com/v0/status?depositAddress=0x394Cce0Fb51EdeA385Df45ceA8fcA2005Fa5636d"
 ```
 
-The buyer agent's live payers (`--live`) use the same checkout but have not yet been run with real funds.
+**A shopping agent buying on its own** (14 Nov 2026), after the user approved a 7 USDC/day spend permission from a Coinbase Smart Wallet:
+
+| Step | Transaction |
+|---|---|
+| The agent finds the Monaco Racing Club Tee ($6, free postage), quotes it through NEAR Intents, and in one user operation pulls **6.063031 USDC** from the shopper's wallet `0xE380…4Ce0` and pays the one-time deposit address `0xcf7C…C870` (19:41:49 UTC) | [Basescan](https://basescan.org/tx/0x4143c1248f5cb6e2e57df46b2122293806b57601f4045d91cd479ff3c6663222) |
+| NEAR Intents delivers **exactly 6.00 USDC** to the seller's wallet on Base, and Port66 records the order | [Basescan](https://basescan.org/tx/0xae212c8a2b38231b253caab01b4fd1e20ab7f835193f3df3ff9cfc4bc6c8e94b) |
+
+```bash
+curl "https://1click.chaindefuser.com/v0/status?depositAddress=0xcf7CA26660adDE62d3c4ea6C2f918b375b0AC870"
+```
+
+The command-line buyer agent's live payers (`--live`) use the same checkout but have not yet been run with real funds.
 
 ## Disclosure (hackathon rules)
 
