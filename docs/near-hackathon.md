@@ -178,5 +178,4 @@ The command-line buyer agent's live payers (`--live`) use the same checkout but 
 ## Links
 
 - Live: https://port66.xyz
-- Demo video: _to be added_
-- X post: _to be added_
+- Demo video and X post: https://x.com/port66x/status/2121733541717286927
